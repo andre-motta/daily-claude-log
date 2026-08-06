@@ -26,8 +26,8 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-CLAUDE_DIR = Path(os.environ.get("DCL_CLAUDE_DIR", os.path.expanduser("~/.claude")))
-DATA_DIR = Path(os.environ.get("DCL_DATA_DIR", os.path.expanduser("~/.daily-claude-log")))
+CLAUDE_DIR = Path(os.path.expanduser(os.environ.get("DCL_CLAUDE_DIR", "~/.claude")))
+DATA_DIR = Path(os.path.expanduser(os.environ.get("DCL_DATA_DIR", "~/.daily-claude-log")))
 DB_PATH = DATA_DIR / "recap.db"
 REPORTS_DIR = DATA_DIR / "reports"
 
