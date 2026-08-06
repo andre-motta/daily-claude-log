@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "daily-claude-log"
+dynamic = ["version"]
+description = "Extract and summarize Claude Code sessions into daily reports"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.9"
+authors = [
+    { name = "Andre Lustosa", email = "alustosa@redhat.com" },
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Documentation",
+    "Topic :: Utilities",
+]
+
+[project.scripts]
+daily-claude-log = "daily_claude_log.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/andre-motta/daily-claude-log"
+Repository = "https://github.com/andre-motta/daily-claude-log"
+Issues = "https://github.com/andre-motta/daily-claude-log/issues"
+
+[tool.setuptools-scm]
+
+[tool.setuptools.packages.find]
+where = ["src"]

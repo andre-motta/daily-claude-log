@@ -48,19 +48,18 @@ check_env() {
 # --- Install binary ---
 
 install_binary() {
-    mkdir -p "$BIN_DIR"
-
-    if [ -L "$BIN_DIR/daily-claude-log" ] || [ -f "$BIN_DIR/daily-claude-log" ]; then
+    # Remove old symlink if present (from pre-pip versions)
+    if [ -L "$BIN_DIR/daily-claude-log" ]; then
         rm "$BIN_DIR/daily-claude-log"
+        info "Removed old symlink"
     fi
 
-    ln -s "$REPO_DIR/recap.py" "$BIN_DIR/daily-claude-log"
-    chmod +x "$REPO_DIR/recap.py"
-    info "Linked daily-claude-log -> $REPO_DIR/recap.py"
+    pip install -e "$REPO_DIR" --quiet 2>/dev/null || pip install -e "$REPO_DIR"
+    info "Installed daily-claude-log via pip (editable mode)"
 
-    if ! echo "$PATH" | grep -q "$BIN_DIR"; then
-        warn "$BIN_DIR not in PATH. Add to shell profile:"
-        warn "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+    if ! command -v daily-claude-log &> /dev/null; then
+        warn "daily-claude-log not found in PATH after pip install"
+        warn "You may need to add your Python scripts directory to PATH"
     fi
 }
 

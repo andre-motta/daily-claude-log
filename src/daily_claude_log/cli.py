@@ -23,7 +23,7 @@ import os
 import re
 import sqlite3
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 CLAUDE_DIR = Path(os.environ.get("DCL_CLAUDE_DIR", os.path.expanduser("~/.claude")))
@@ -31,9 +31,11 @@ DATA_DIR = Path(os.environ.get("DCL_DATA_DIR", os.path.expanduser("~/.daily-clau
 DB_PATH = DATA_DIR / "recap.db"
 REPORTS_DIR = DATA_DIR / "reports"
 
+SCHEMA_VERSION = 2
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
-    session_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
     date TEXT NOT NULL,
     project TEXT NOT NULL,
     project_short TEXT NOT NULL,
@@ -52,7 +54,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     user_snippets TEXT DEFAULT '[]',
     assistant_snippets TEXT DEFAULT '[]',
     jsonl_path TEXT,
-    processed_at TEXT
+    processed_at TEXT,
+    PRIMARY KEY (session_id, date)
 );
 
 CREATE TABLE IF NOT EXISTS daily_summaries (
@@ -60,6 +63,11 @@ CREATE TABLE IF NOT EXISTS daily_summaries (
     summary_md TEXT,
     digest TEXT,
     generated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_date ON sessions(date);
@@ -72,8 +80,31 @@ def get_db():
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(str(DB_PATH))
     db.execute("PRAGMA journal_mode=WAL")
+    _migrate(db)
     db.executescript(SCHEMA)
     return db
+
+
+def _migrate(db):
+    """Migrate from old schema if needed."""
+    try:
+        info = db.execute("PRAGMA table_info(sessions)").fetchall()
+    except Exception:
+        return
+    if not info:
+        return
+    pk_cols = [col for col in info if col[5] > 0]
+    if len(pk_cols) == 1 and pk_cols[0][1] == "session_id":
+        print(
+            "Migrating DB: session_id -> (session_id, date) composite key...",
+            file=sys.stderr,
+        )
+        print(
+            "Run 'backfill' to re-collect sessions with correct per-day splitting.",
+            file=sys.stderr,
+        )
+        db.execute("DROP TABLE IF EXISTS sessions")
+        db.commit()
 
 
 def project_short_name(project_dir):
@@ -81,7 +112,7 @@ def project_short_name(project_dir):
     parts = project_dir.split("-")
     try:
         git_idx = parts.index("git")
-        remainder = parts[git_idx + 1:]
+        remainder = parts[git_idx + 1 :]
         if not remainder:
             return "~"
         return "/".join(remainder)
@@ -106,7 +137,9 @@ def _extract_commit_message(cmd):
             if in_heredoc:
                 if stripped in ("EOF", "EOF)", "'EOF'"):
                     break
-                if stripped and not stripped.startswith("Co-Authored") and not stripped.startswith("Signed-off"):
+                if stripped and not stripped.startswith(
+                    "Co-Authored"
+                ) and not stripped.startswith("Signed-off"):
                     return stripped
             if "<<" in line and "EOF" in line:
                 in_heredoc = True
@@ -114,24 +147,53 @@ def _extract_commit_message(cmd):
     return None
 
 
+def _local_date(ts_str):
+    """Convert ISO timestamp string to local date (YYYY-MM-DD).
+
+    Treats all timestamps as UTC, converts to system local timezone.
+    """
+    if not ts_str:
+        return None
+    ts_clean = ts_str.replace("Z", "")
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            utc_dt = datetime.strptime(ts_clean[:26], fmt).replace(
+                tzinfo=timezone.utc
+            )
+            return utc_dt.astimezone().strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+
 def extract_session(jsonl_path):
-    """Parse a JSONL transcript and extract structured session data."""
-    data = {
-        "session_id": None,
-        "title": None,
-        "started_at": None,
-        "ended_at": None,
-        "timestamps": [],
-        "user_messages": 0,
-        "assistant_messages": 0,
-        "files_touched": set(),
-        "tools_used": {},
-        "commits": [],
-        "mr_prs": [],
-        "jira_tickets": set(),
-        "user_snippets": [],
-        "assistant_snippets": [],
-    }
+    """Parse JSONL transcript and extract per-date session data.
+
+    Returns (session_id, title, dates_dict) where dates_dict maps
+    local date strings to stat dicts. Sessions spanning midnight are
+    split into separate date entries.
+    """
+    session_id = None
+    title = None
+    dates = {}
+
+    def _acc(date_str):
+        if date_str not in dates:
+            dates[date_str] = {
+                "started_at": None,
+                "ended_at": None,
+                "timestamps": [],
+                "user_messages": 0,
+                "assistant_messages": 0,
+                "files_touched": set(),
+                "tools_used": {},
+                "commits": [],
+                "mr_prs": [],
+                "jira_tickets": set(),
+                "user_snippets": [],
+                "assistant_snippets": [],
+            }
+        return dates[date_str]
 
     jira_re = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")
     commit_re = re.compile(r"git commit\b")
@@ -146,34 +208,47 @@ def extract_session(jsonl_path):
             entry_type = entry.get("type")
             timestamp = entry.get("timestamp")
 
+            ts_str = None
+            date_str = None
             if timestamp:
-                ts = timestamp if isinstance(timestamp, str) else datetime.fromtimestamp(timestamp / 1000).isoformat()
-                data["timestamps"].append(ts)
-                if data["started_at"] is None:
-                    data["started_at"] = ts
-                data["ended_at"] = ts
+                ts_str = (
+                    timestamp
+                    if isinstance(timestamp, str)
+                    else datetime.fromtimestamp(
+                        timestamp / 1000, tz=timezone.utc
+                    ).isoformat()
+                )
+                date_str = _local_date(ts_str)
 
             if entry_type == "ai-title":
-                data["title"] = entry.get("aiTitle")
-                data["session_id"] = entry.get("sessionId")
-
+                title = entry.get("aiTitle")
+                session_id = entry.get("sessionId")
             elif entry_type in ("mode", "permission-mode", "last-prompt"):
-                if not data["session_id"]:
-                    data["session_id"] = entry.get("sessionId")
+                if not session_id:
+                    session_id = entry.get("sessionId")
 
-            elif entry_type == "user":
-                data["user_messages"] += 1
+            if date_str is None:
+                continue
+
+            acc = _acc(date_str)
+            acc["timestamps"].append(ts_str)
+            if acc["started_at"] is None:
+                acc["started_at"] = ts_str
+            acc["ended_at"] = ts_str
+
+            if entry_type == "user":
+                acc["user_messages"] += 1
                 msg = entry.get("message", {})
                 content = msg.get("content", "") if isinstance(msg, dict) else ""
                 if isinstance(content, str) and content.strip():
                     snippet = content.strip().split("\n")[0][:200]
-                    if len(data["user_snippets"]) < 10:
-                        data["user_snippets"].append(snippet)
+                    if len(acc["user_snippets"]) < 10:
+                        acc["user_snippets"].append(snippet)
                     tickets = jira_re.findall(content)
-                    data["jira_tickets"].update(tickets)
+                    acc["jira_tickets"].update(tickets)
 
             elif entry_type == "assistant":
-                data["assistant_messages"] += 1
+                acc["assistant_messages"] += 1
                 msg = entry.get("message", {})
                 content = msg.get("content", []) if isinstance(msg, dict) else []
                 if isinstance(content, list):
@@ -183,62 +258,71 @@ def extract_session(jsonl_path):
 
                         if block.get("type") == "text":
                             txt = block.get("text", "").strip()
-                            if txt and len(data["assistant_snippets"]) < 5:
+                            if txt and len(acc["assistant_snippets"]) < 5:
                                 snippet = txt.split("\n")[0][:200]
                                 if len(snippet) > 20:
-                                    data["assistant_snippets"].append(snippet)
+                                    acc["assistant_snippets"].append(snippet)
 
                         elif block.get("type") == "tool_use":
                             tool_name = block.get("name", "unknown")
-                            data["tools_used"][tool_name] = data["tools_used"].get(tool_name, 0) + 1
+                            acc["tools_used"][tool_name] = (
+                                acc["tools_used"].get(tool_name, 0) + 1
+                            )
                             inp = block.get("input", {})
 
                             if tool_name in ("Edit", "Write"):
                                 fp = inp.get("file_path", "")
                                 if fp:
-                                    data["files_touched"].add(fp)
+                                    acc["files_touched"].add(fp)
 
                             elif tool_name == "Read":
                                 fp = inp.get("file_path", "")
                                 if fp:
-                                    data["files_touched"].add(fp)
+                                    acc["files_touched"].add(fp)
 
                             elif tool_name == "Bash":
                                 cmd = inp.get("command", "")
                                 if commit_re.search(cmd):
                                     commit_msg = _extract_commit_message(cmd)
                                     if commit_msg:
-                                        data["commits"].append(commit_msg[:120])
+                                        acc["commits"].append(commit_msg[:120])
                                 tickets = jira_re.findall(cmd)
-                                data["jira_tickets"].update(tickets)
+                                acc["jira_tickets"].update(tickets)
 
                             elif tool_name == "NotebookEdit":
                                 fp = inp.get("file_path", "")
                                 if fp:
-                                    data["files_touched"].add(fp)
+                                    acc["files_touched"].add(fp)
 
             elif entry_type == "pr-link":
                 pr_url = entry.get("prUrl", "")
                 pr_num = entry.get("prNumber", "")
                 pr_repo = entry.get("prRepository", "")
                 if pr_url:
-                    data["mr_prs"].append({
-                        "url": pr_url,
-                        "number": pr_num,
-                        "repo": pr_repo,
-                    })
+                    acc["mr_prs"].append(
+                        {
+                            "url": pr_url,
+                            "number": pr_num,
+                            "repo": pr_repo,
+                        }
+                    )
 
-    data["files_touched"] = sorted(data["files_touched"])
-    data["jira_tickets"] = sorted(data["jira_tickets"])
+    for acc in dates.values():
+        acc["files_touched"] = sorted(acc["files_touched"])
+        acc["jira_tickets"] = sorted(acc["jira_tickets"])
 
-    return data
+    return session_id, title, dates
 
 
 def parse_timestamp(ts):
     """Parse ISO timestamp string to datetime."""
     if not ts:
         return None
-    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%fZ"):
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+    ):
         try:
             return datetime.strptime(ts[:26], fmt)
         except ValueError:
@@ -276,16 +360,6 @@ def compute_active_duration(timestamps):
     return active_seconds / 60
 
 
-def date_from_timestamp(ts):
-    """Extract date string from ISO timestamp."""
-    if not ts:
-        return None
-    try:
-        return ts[:10]
-    except Exception:
-        return None
-
-
 def find_session_jsonl(session_id):
     """Find JSONL file for a session ID."""
     for jsonl in CLAUDE_DIR.glob("projects/*/*.jsonl"):
@@ -295,7 +369,11 @@ def find_session_jsonl(session_id):
 
 
 def find_all_sessions(days=None, target_date=None):
-    """Find all session JSONL files, optionally filtered."""
+    """Find all session JSONL files, optionally filtered by recency.
+
+    Uses file mtime as a rough filter for discovery. Actual date
+    assignment happens during collection based on message timestamps.
+    """
     sessions = []
     for jsonl in sorted(CLAUDE_DIR.glob("projects/*/*.jsonl")):
         if "/subagents/" in str(jsonl):
@@ -304,27 +382,31 @@ def find_all_sessions(days=None, target_date=None):
         mtime = datetime.fromtimestamp(stat.st_mtime)
 
         if days is not None:
-            cutoff = datetime.now() - timedelta(days=days)
+            cutoff = datetime.now() - timedelta(days=days + 1)
             if mtime < cutoff:
                 continue
 
         if target_date:
-            file_date = mtime.strftime("%Y-%m-%d")
-            if file_date != target_date:
+            target_dt = datetime.strptime(target_date, "%Y-%m-%d")
+            if mtime < target_dt - timedelta(days=1):
+                continue
+            if mtime > target_dt + timedelta(days=2):
                 continue
 
         project_dir = jsonl.parent.name
-        sessions.append({
-            "session_id": jsonl.stem,
-            "jsonl_path": str(jsonl),
-            "project_dir": project_dir,
-            "mtime": mtime,
-        })
+        sessions.append(
+            {
+                "session_id": jsonl.stem,
+                "jsonl_path": str(jsonl),
+                "project_dir": project_dir,
+                "mtime": mtime,
+            }
+        )
     return sessions
 
 
 def collect_session(session_id, jsonl_path=None, db=None):
-    """Extract and store one session."""
+    """Extract and store one session, split across dates it spans."""
     if jsonl_path is None:
         jsonl_path = find_session_jsonl(session_id)
     if not jsonl_path or not os.path.exists(jsonl_path):
@@ -336,74 +418,88 @@ def collect_session(session_id, jsonl_path=None, db=None):
         close_db = True
 
     existing = db.execute(
-        "SELECT session_id FROM sessions WHERE session_id = ?", (session_id,)
+        "SELECT processed_at FROM sessions WHERE session_id = ? LIMIT 1",
+        (session_id,),
     ).fetchone()
+
+    was_update = False
     if existing:
-        if close_db:
-            db.close()
-        return "exists"
+        file_mtime = datetime.fromtimestamp(os.path.getmtime(jsonl_path))
+        processed_at = parse_timestamp(existing[0])
+        if processed_at and file_mtime <= processed_at:
+            if close_db:
+                db.close()
+            return "exists"
+        db.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        was_update = True
 
     project_dir = Path(jsonl_path).parent.name
-    data = extract_session(jsonl_path)
+    sid, title, dates = extract_session(jsonl_path)
 
-    if not data["session_id"]:
-        data["session_id"] = session_id
+    if not sid:
+        sid = session_id
 
-    mtime = datetime.fromtimestamp(os.path.getmtime(jsonl_path))
-    session_date = mtime.strftime("%Y-%m-%d")
+    if not dates:
+        if close_db:
+            db.close()
+        return None
 
-    duration = compute_active_duration(data["timestamps"])
+    now = datetime.now().isoformat()
+    for date_str, data in sorted(dates.items()):
+        duration = compute_active_duration(data["timestamps"])
+        db.execute(
+            """INSERT OR REPLACE INTO sessions
+            (session_id, date, project, project_short, title,
+             started_at, ended_at, duration_minutes,
+             user_messages, assistant_messages,
+             files_touched, tools_used, commits, mr_prs, jira_tickets,
+             key_topics, user_snippets, assistant_snippets,
+             jsonl_path, processed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                sid,
+                date_str,
+                project_dir,
+                project_short_name(project_dir),
+                title,
+                data["started_at"],
+                data["ended_at"],
+                round(duration, 1),
+                data["user_messages"],
+                data["assistant_messages"],
+                json.dumps(data["files_touched"]),
+                json.dumps(data["tools_used"]),
+                json.dumps(data["commits"]),
+                json.dumps(data["mr_prs"]),
+                json.dumps(data["jira_tickets"]),
+                json.dumps([]),
+                json.dumps(data["user_snippets"]),
+                json.dumps(data["assistant_snippets"]),
+                jsonl_path,
+                now,
+            ),
+        )
 
-    db.execute(
-        """INSERT OR REPLACE INTO sessions
-        (session_id, date, project, project_short, title,
-         started_at, ended_at, duration_minutes,
-         user_messages, assistant_messages,
-         files_touched, tools_used, commits, mr_prs, jira_tickets,
-         key_topics, user_snippets, assistant_snippets,
-         jsonl_path, processed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            data["session_id"],
-            session_date,
-            project_dir,
-            project_short_name(project_dir),
-            data["title"],
-            data["started_at"],
-            data["ended_at"],
-            round(duration, 1),
-            data["user_messages"],
-            data["assistant_messages"],
-            json.dumps(data["files_touched"]),
-            json.dumps(data["tools_used"]),
-            json.dumps(data["commits"]),
-            json.dumps(data["mr_prs"]),
-            json.dumps(data["jira_tickets"]),
-            json.dumps([]),
-            json.dumps(data["user_snippets"]),
-            json.dumps(data["assistant_snippets"]),
-            jsonl_path,
-            datetime.now().isoformat(),
-        ),
-    )
     db.commit()
     if close_db:
         db.close()
-    return "collected"
+    return "updated" if was_update else "collected"
 
 
 def cmd_collect(args):
     """Collect a single session."""
     if len(args) < 1:
-        print("Usage: recap.py collect <session_id> [jsonl_path]")
+        print("Usage: daily-claude-log collect <session_id> [jsonl_path]")
         sys.exit(1)
     session_id = args[0]
     jsonl_path = args[1] if len(args) > 1 else None
     result = collect_session(session_id, jsonl_path)
     if result == "exists":
-        print(f"Session {session_id} already collected")
+        print(f"Session {session_id} already collected (unchanged)")
     elif result == "collected":
         print(f"Collected session {session_id}")
+    elif result == "updated":
+        print(f"Updated session {session_id} (file changed since last collection)")
     else:
         print(f"Could not find session {session_id}")
 
@@ -420,16 +516,23 @@ def cmd_collect_all(args):
     sessions = find_all_sessions(target_date=target_date)
     db = get_db()
     collected = 0
+    updated = 0
     skipped = 0
     for s in sessions:
         result = collect_session(s["session_id"], s["jsonl_path"], db)
         if result == "collected":
             collected += 1
+        elif result == "updated":
+            updated += 1
         else:
             skipped += 1
 
     db.close()
-    print(f"Date {target_date}: collected {collected}, skipped {skipped} (already processed)")
+    parts = [f"collected {collected}"]
+    if updated:
+        parts.append(f"updated {updated}")
+    parts.append(f"skipped {skipped} (already processed)")
+    print(f"Date {target_date}: {', '.join(parts)}")
 
 
 def cmd_backfill(args):
@@ -442,6 +545,7 @@ def cmd_backfill(args):
     sessions = find_all_sessions(days=days)
     db = get_db()
     collected = 0
+    updated = 0
     skipped = 0
     errors = 0
     for s in sessions:
@@ -449,16 +553,23 @@ def cmd_backfill(args):
             result = collect_session(s["session_id"], s["jsonl_path"], db)
             if result == "collected":
                 collected += 1
+            elif result == "updated":
+                updated += 1
             else:
                 skipped += 1
         except Exception as e:
             errors += 1
-            print(f"  Error processing {s['session_id']}: {e}", file=sys.stderr)
+            print(
+                f"  Error processing {s['session_id']}: {e}",
+                file=sys.stderr,
+            )
 
     db.close()
-    total = collected + skipped + errors
+    total = collected + updated + skipped + errors
     print(f"Backfill ({days} days): {total} sessions found")
     print(f"  Collected: {collected}")
+    if updated:
+        print(f"  Updated: {updated}")
     print(f"  Already processed: {skipped}")
     if errors:
         print(f"  Errors: {errors}")
@@ -485,7 +596,10 @@ def cmd_prompt(args):
     db.close()
 
     if not rows:
-        print(f"No sessions found for {target_date}. Run 'collect-all --date {target_date}' first.")
+        print(
+            f"No sessions found for {target_date}. "
+            f"Run 'collect-all --date {target_date}' first."
+        )
         sys.exit(1)
 
     prompt = build_summary_prompt(target_date, rows)
@@ -499,7 +613,9 @@ def build_summary_prompt(date, rows):
         f"Total sessions: {len(rows)}",
         "",
         "Generate TWO outputs:",
-        "1. FULL REPORT in markdown with: Summary (3-5 sentences), Sessions grouped by project, Key Accomplishments, Open Threads (anything that seems unfinished), Stats",
+        "1. FULL REPORT in markdown with: Summary (3-5 sentences), "
+        "Sessions grouped by project, Key Accomplishments, "
+        "Open Threads (anything that seems unfinished), Stats",
         "2. DIGEST: single paragraph, under 80 words, what mattered most",
         "",
         "Separate with '---DIGEST---' marker.",
@@ -516,9 +632,23 @@ def build_summary_prompt(date, rows):
     all_tickets = set()
 
     for row in rows:
-        (_, project, title, _, _, duration,
-         _, _, files_j, tools_j, commits_j,
-         mrs_j, tickets_j, user_snip_j, asst_snip_j) = row
+        (
+            _,
+            project,
+            title,
+            _,
+            _,
+            duration,
+            _,
+            _,
+            files_j,
+            tools_j,
+            commits_j,
+            mrs_j,
+            tickets_j,
+            user_snip_j,
+            asst_snip_j,
+        ) = row
 
         files = json.loads(files_j)
         tools = json.loads(tools_j)
@@ -553,7 +683,9 @@ def build_summary_prompt(date, rows):
             session_lines.append(f"  Files: {', '.join(short_files)}")
 
         if commits:
-            session_lines.append(f"  Commits: {'; '.join(c[:60] for c in commits[:3])}")
+            session_lines.append(
+                f"  Commits: {'; '.join(c[:60] for c in commits[:3])}"
+            )
 
         if mrs:
             mr_strs = [m.get("url", "") for m in mrs[:3]]
@@ -567,7 +699,9 @@ def build_summary_prompt(date, rows):
 
         projects[project].append("\n".join(session_lines))
 
-    lines.append(f"Active time: ~{int(total_duration)}m across {len(projects)} projects")
+    lines.append(
+        f"Active time: ~{int(total_duration)}m across {len(projects)} projects"
+    )
     lines.append(f"Files touched: {len(total_files)}")
     lines.append(f"Commits: {len(total_commits)}")
     if total_mrs:
@@ -588,7 +722,7 @@ def build_summary_prompt(date, rows):
 def cmd_store_summary(args):
     """Store a generated summary."""
     if len(args) < 2:
-        print("Usage: recap.py store-summary <date> <summary_file>")
+        print("Usage: daily-claude-log store-summary <date> <summary_file>")
         sys.exit(1)
 
     date = args[0]
@@ -606,7 +740,8 @@ def cmd_store_summary(args):
 
     db = get_db()
     db.execute(
-        """INSERT OR REPLACE INTO daily_summaries (date, summary_md, digest, generated_at)
+        """INSERT OR REPLACE INTO daily_summaries
+           (date, summary_md, digest, generated_at)
            VALUES (?, ?, ?, ?)""",
         (date, summary_md, digest, datetime.now().isoformat()),
     )
@@ -700,14 +835,24 @@ def cmd_export(args):
         "SELECT * FROM sessions WHERE date = ? ORDER BY started_at",
         (target_date,),
     ).fetchall()
-    cols = [d[0] for d in db.execute("SELECT * FROM sessions LIMIT 0").description]
+    cols = [
+        d[0] for d in db.execute("SELECT * FROM sessions LIMIT 0").description
+    ]
     db.close()
 
     sessions = []
     for row in rows:
         entry = dict(zip(cols, row))
-        for key in ("files_touched", "tools_used", "commits", "mr_prs",
-                     "jira_tickets", "key_topics", "user_snippets", "assistant_snippets"):
+        for key in (
+            "files_touched",
+            "tools_used",
+            "commits",
+            "mr_prs",
+            "jira_tickets",
+            "key_topics",
+            "user_snippets",
+            "assistant_snippets",
+        ):
             if key in entry and isinstance(entry[key], str):
                 entry[key] = json.loads(entry[key])
         sessions.append(entry)
@@ -732,7 +877,17 @@ def cmd_list_dates(_args):
     for date, count, total_min, projects in rows:
         has_summary = (REPORTS_DIR / date / "full.md").exists()
         marker = " [summarized]" if has_summary else ""
-        print(f"  {date}: {count} sessions, {int(total_min or 0)}m, {projects} projects{marker}")
+        print(
+            f"  {date}: {count} sessions, "
+            f"{int(total_min or 0)}m, {projects} projects{marker}"
+        )
+
+
+def cmd_version(_args):
+    """Print version."""
+    from daily_claude_log import __version__
+
+    print(f"daily-claude-log {__version__}")
 
 
 def main():
@@ -752,6 +907,8 @@ def main():
         "status": cmd_status,
         "export": cmd_export,
         "list-dates": cmd_list_dates,
+        "version": cmd_version,
+        "--version": cmd_version,
     }
 
     if cmd in commands:
