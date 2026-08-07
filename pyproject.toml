@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=64", "setuptools-scm>=8"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
 
 [project]
 name = "daily-claude-log"
@@ -33,7 +33,8 @@ Homepage = "https://github.com/andre-motta/daily-claude-log"
 Repository = "https://github.com/andre-motta/daily-claude-log"
 Issues = "https://github.com/andre-motta/daily-claude-log/issues"
 
-[tool.setuptools-scm]
+[tool.hatch.version]
+source = "vcs"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.hatch.build.targets.wheel]
+packages = ["src/daily_claude_log"]
