@@ -1,6 +1,6 @@
 ---
 name: daily-summary
-description: Generate AI summary of your Claude Code sessions for a given day. Collects session data, builds a token-efficient prompt, and uses a fast model to synthesize a daily report + digest. Use when asked for a daily summary, end-of-day recap, or "what did I do today".
+description: Generate AI summary of your Claude Code and Codex sessions for a given day. Collects session data, builds a token-efficient prompt, and uses a fast model to synthesize a daily report + digest. Use when asked for a daily summary, end-of-day recap, or "what did I do today".
 arguments: [date]
 argument-hint: [YYYY-MM-DD] (default: today)
 allowed-tools: Bash(python3 *) Bash(daily-claude-log *) Bash(git *) Bash(cat *) Bash(ls *) Bash(date *) Read Write Agent
@@ -8,7 +8,7 @@ allowed-tools: Bash(python3 *) Bash(daily-claude-log *) Bash(git *) Bash(cat *) 
 
 # Daily Summary
 
-Generate an AI-powered summary of today's Claude Code sessions.
+Generate an AI-powered summary of today's Claude Code and Codex sessions.
 
 **Input:** `$ARGUMENTS`
 
@@ -47,7 +47,9 @@ Read the prompt file to see what data is available.
 
 ## Step 4: Generate summary
 
-Spawn an Agent with model "haiku" to generate the summary. Pass it the prompt content.
+Spawn a subagent with model `gpt-5.6-luna` and low reasoning effort to generate
+the summary. Pass it the prompt content. This is Codex's efficient model for a
+focused synthesis task.
 
 The agent should produce TWO sections separated by `---DIGEST---`:
 1. A full markdown daily report

@@ -2,8 +2,11 @@
 set -euo pipefail
 
 CLAUDE_DIR="$HOME/.claude"
-SETTINGS_FILE="$CLAUDE_DIR/settings.json"
-SKILLS_DIR="$CLAUDE_DIR/skills"
+CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
+CLAUDE_SETTINGS_FILE="$CLAUDE_DIR/settings.json"
+CODEX_HOOKS_FILE="$CODEX_DIR/hooks.json"
+CLAUDE_SKILLS_DIR="$CLAUDE_DIR/skills"
+CODEX_SKILLS_DIR="$HOME/.agents/skills"
 BIN_DIR="$HOME/.local/bin"
 
 GREEN='\033[0;32m'
@@ -23,12 +26,19 @@ if [ -L "$BIN_DIR/daily-claude-log" ]; then
     info "Removed symlink $BIN_DIR/daily-claude-log"
 fi
 
-# Remove hook from settings.json
-if [ -f "$SETTINGS_FILE" ]; then
-    python3 -c "
+# Remove hooks from Claude Code and Codex settings.
+remove_hook() {
+    local settings_file="$1"
+    local host_name="$2"
+    if [ ! -f "$settings_file" ]; then
+        return
+    fi
+    python3 - "$settings_file" <<'PY'
 import json
+import sys
 
-with open('$SETTINGS_FILE') as f:
+settings_path = sys.argv[1]
+with open(settings_path) as f:
     settings = json.load(f)
 
 hooks = settings.get('hooks', {})
@@ -40,19 +50,25 @@ hooks['SessionEnd'] = [
 if not hooks['SessionEnd']:
     del hooks['SessionEnd']
 
-with open('$SETTINGS_FILE', 'w') as f:
+with open(settings_path, 'w') as f:
     json.dump(settings, f, indent=2)
     f.write('\n')
-" 2>/dev/null && info "Removed SessionEnd hook" || warn "Could not remove hook"
-fi
+PY
+    info "Removed $host_name SessionEnd hook"
+}
+
+remove_hook "$CLAUDE_SETTINGS_FILE" "Claude Code"
+remove_hook "$CODEX_HOOKS_FILE" "Codex"
 
 # Remove skill symlinks
-for skill in daily-summary collect-session; do
-    target="$SKILLS_DIR/$skill"
-    if [ -L "$target" ]; then
-        rm "$target"
-        info "Removed skill: $skill"
-    fi
+for skills_dir in "$CLAUDE_SKILLS_DIR" "$CODEX_SKILLS_DIR"; do
+    for skill in daily-summary collect-session; do
+        target="$skills_dir/$skill"
+        if [ -L "$target" ]; then
+            rm "$target"
+            info "Removed skill: $target"
+        fi
+    done
 done
 
 echo ""

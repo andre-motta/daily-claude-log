@@ -1,6 +1,6 @@
 ---
 name: collect-session
-description: Manually collect the current Claude Code session into daily-claude-log. Use when you want to ensure a session is logged before it ends, or to verify collection is working.
+description: Manually collect the current Claude Code or Codex session into daily-claude-log. Use when you want to ensure a session is logged before it ends, or to verify collection is working.
 arguments: []
 argument-hint: (no arguments)
 allowed-tools: Bash(daily-claude-log *) Bash(python3 *) Bash(echo *) Bash(date *)
@@ -12,10 +12,11 @@ Manually trigger collection of the current Claude Code session.
 
 ## Step 1: Collect
 
-The current session ID is available via `$CLAUDE_CODE_SESSION_ID` environment variable.
+Use the session ID exposed by the current agent host.
 
 ```bash
-daily-claude-log collect "$CLAUDE_CODE_SESSION_ID"
+session_id="${CODEX_SESSION_ID:-${CODEX_THREAD_ID:-$CLAUDE_CODE_SESSION_ID}}"
+daily-claude-log collect "$session_id"
 ```
 
 ## Step 2: Show status

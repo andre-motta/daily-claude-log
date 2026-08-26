@@ -2,12 +2,15 @@
 set -euo pipefail
 
 # daily-claude-log installer
-# Sets up hooks, skills, and symlink for Claude Code session tracking.
+# Sets up hooks and skills for Claude Code and Codex session tracking.
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 CLAUDE_DIR="$HOME/.claude"
-SETTINGS_FILE="$CLAUDE_DIR/settings.json"
-SKILLS_DIR="$CLAUDE_DIR/skills"
+CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
+CLAUDE_SETTINGS_FILE="$CLAUDE_DIR/settings.json"
+CODEX_HOOKS_FILE="$CODEX_DIR/hooks.json"
+CLAUDE_SKILLS_DIR="$CLAUDE_DIR/skills"
+CODEX_SKILLS_DIR="$HOME/.agents/skills"
 BIN_DIR="$HOME/.local/bin"
 
 GREEN='\033[0;32m'
@@ -36,6 +39,7 @@ check_env() {
         echo ""
         echo "  export DCL_DATA_DIR=\"$data_dir\""
         echo "  export DCL_CLAUDE_DIR=\"$HOME/.claude\"  # optional, this is the default"
+        echo "  export DCL_CODEX_DIR=\"$CODEX_DIR\"  # optional, this is the default"
         echo ""
 
         export DCL_DATA_DIR="$data_dir"
@@ -65,71 +69,66 @@ install_binary() {
 
 # --- Install hook ---
 
-install_hook() {
-    if [ ! -f "$SETTINGS_FILE" ]; then
-        warn "Claude Code settings not found at $SETTINGS_FILE"
-        warn "Skipping hook. Run Claude Code once first, then re-run install."
-        return
+install_hook_file() {
+    local settings_file="$1"
+    local host_name="$2"
+    local hook_cmd="$BIN_DIR/daily-claude-log collect-hook"
+
+    mkdir -p "$(dirname "$settings_file")"
+    if [ ! -f "$settings_file" ]; then
+        echo '{}' > "$settings_file"
     fi
 
-    local hook_cmd="$BIN_DIR/daily-claude-log collect \$CLAUDE_CODE_SESSION_ID"
-
-    python3 -c "
-import json, sys
-
-with open('$SETTINGS_FILE') as f:
-    settings = json.load(f)
-
-hooks = settings.setdefault('hooks', {})
-session_end = hooks.setdefault('SessionEnd', [])
-
-for group in session_end:
-    for h in group.get('hooks', []):
-        if 'daily-claude-log' in h.get('command', ''):
-            print('exists')
-            sys.exit(0)
-
-session_end.append({
-    'hooks': [{
-        'type': 'command',
-        'command': '$hook_cmd',
-        'timeout': 10
-    }]
-})
-
-with open('$SETTINGS_FILE', 'w') as f:
-    json.dump(settings, f, indent=2)
-    f.write('\n')
-
-print('installed')
-" 2>/dev/null
-
-    if python3 -c "
+    python3 - "$settings_file" "$hook_cmd" <<'PY'
 import json
-with open('$SETTINGS_FILE') as f:
-    s = json.load(f)
-for g in s.get('hooks',{}).get('SessionEnd',[]):
-    for h in g.get('hooks',[]):
-        if 'daily-claude-log' in h.get('command',''):
-            exit(0)
-exit(1)
-" 2>/dev/null; then
-        info "SessionEnd hook installed"
-    else
-        warn "Could not install hook. Add manually to $SETTINGS_FILE"
-    fi
+import sys
+
+settings_path, hook_command = sys.argv[1:]
+with open(settings_path) as settings_file:
+    settings = json.load(settings_file)
+
+session_end = settings.setdefault("hooks", {}).setdefault("SessionEnd", [])
+found = False
+for group in session_end:
+    for hook in group.get("hooks", []):
+        if "daily-claude-log" in hook.get("command", ""):
+            hook["command"] = hook_command
+            hook["timeout"] = 10
+            found = True
+
+if not found:
+    session_end.append({
+        "hooks": [{
+            "type": "command",
+            "command": hook_command,
+            "timeout": 10,
+        }]
+    })
+
+with open(settings_path, "w") as settings_file:
+    json.dump(settings, settings_file, indent=2)
+    settings_file.write("\n")
+PY
+    info "$host_name SessionEnd hook installed"
+}
+
+install_hooks() {
+    install_hook_file "$CLAUDE_SETTINGS_FILE" "Claude Code"
+    install_hook_file "$CODEX_HOOKS_FILE" "Codex"
 }
 
 # --- Install skills ---
 
-install_skills() {
-    mkdir -p "$SKILLS_DIR"
+install_skills_in() {
+    local skills_dir="$1"
+    local host_name="$2"
+    mkdir -p "$skills_dir"
 
     for skill_dir in "$REPO_DIR"/skills/*/; do
         [ -d "$skill_dir" ] || continue
         local skill_name
         skill_name="$(basename "$skill_dir")"
-        local target="$SKILLS_DIR/$skill_name"
+        local target="$skills_dir/$skill_name"
 
         if [ -L "$target" ]; then
             rm "$target"
@@ -141,14 +140,19 @@ install_skills() {
         fi
 
         ln -s "$skill_dir" "$target"
-        info "Skill installed: $skill_name"
+        info "$host_name skill installed: $skill_name"
     done
+}
+
+install_skills() {
+    install_skills_in "$CLAUDE_SKILLS_DIR" "Claude Code"
+    install_skills_in "$CODEX_SKILLS_DIR" "Codex"
 }
 
 # --- Init database ---
 
 init_db() {
-    python3 "$REPO_DIR/recap.py" list-dates > /dev/null 2>&1
+    daily-claude-log list-dates > /dev/null 2>&1
     info "Database initialized"
 }
 
@@ -160,7 +164,7 @@ echo ""
 
 check_env
 install_binary
-install_hook
+install_hooks
 install_skills
 init_db
 
@@ -172,9 +176,9 @@ echo "    daily-claude-log status              # today's sessions"
 echo "    daily-claude-log backfill --days 30   # populate historical data"
 echo "    daily-claude-log list-dates           # all dates with data"
 echo ""
-echo "  Claude Code skills:"
+echo "  Claude Code and Codex skills:"
 echo "    /daily-summary                        # generate AI summary of your day"
 echo "    /collect-session                      # manually log current session"
 echo ""
-echo "  Sessions auto-collected on Claude Code exit."
+echo "  Sessions auto-collected when Claude Code or Codex ends a session."
 echo ""

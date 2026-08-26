@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "daily-claude-log"
 dynamic = ["version"]
-description = "Extract and summarize Claude Code sessions into daily reports"
+description = "Extract and summarize Claude Code and Codex sessions into daily reports"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.9"

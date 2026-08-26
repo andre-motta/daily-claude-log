@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""daily-claude-log: Extract and summarize Claude Code sessions.
+"""daily-claude-log: Extract and summarize Claude Code and Codex sessions.
 
 Single-file, stdlib-only. No pip dependencies.
 
 Commands:
     collect <session_id>          Process one session from its JSONL transcript
+    collect-hook                  Process the session identified by hook JSON on stdin
     collect-all [--date DATE]     Process all sessions for a date (default: today)
     backfill [--days N]           Process all sessions from last N days (default: 30)
     prompt [--date DATE]          Generate summary prompt for LLM consumption
@@ -16,6 +17,7 @@ Commands:
 Environment variables:
     DCL_DATA_DIR     Where DB + summaries go (default: ~/.daily-claude-log)
     DCL_CLAUDE_DIR   Where Claude Code stores transcripts (default: ~/.claude)
+    DCL_CODEX_DIR    Where Codex stores transcripts (default: ~/.codex)
 """
 
 import json
@@ -27,7 +29,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 CLAUDE_DIR = Path(os.path.expanduser(os.environ.get("DCL_CLAUDE_DIR", "~/.claude")))
-DATA_DIR = Path(os.path.expanduser(os.environ.get("DCL_DATA_DIR", "~/.daily-claude-log")))
+CODEX_DIR = Path(os.path.expanduser(os.environ.get("DCL_CODEX_DIR", "~/.codex")))
+DATA_DIR = Path(
+    os.path.expanduser(os.environ.get("DCL_DATA_DIR", "~/.daily-claude-log"))
+)
 DB_PATH = DATA_DIR / "recap.db"
 REPORTS_DIR = DATA_DIR / "reports"
 
@@ -137,9 +142,11 @@ def _extract_commit_message(cmd):
             if in_heredoc:
                 if stripped in ("EOF", "EOF)", "'EOF'"):
                     break
-                if stripped and not stripped.startswith(
-                    "Co-Authored"
-                ) and not stripped.startswith("Signed-off"):
+                if (
+                    stripped
+                    and not stripped.startswith("Co-Authored")
+                    and not stripped.startswith("Signed-off")
+                ):
                     return stripped
             if "<<" in line and "EOF" in line:
                 in_heredoc = True
@@ -157,16 +164,14 @@ def _local_date(ts_str):
     ts_clean = ts_str.replace("Z", "")
     for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
         try:
-            utc_dt = datetime.strptime(ts_clean[:26], fmt).replace(
-                tzinfo=timezone.utc
-            )
+            utc_dt = datetime.strptime(ts_clean[:26], fmt).replace(tzinfo=timezone.utc)
             return utc_dt.astimezone().strftime("%Y-%m-%d")
         except ValueError:
             continue
     return None
 
 
-def extract_session(jsonl_path):
+def _extract_claude_session(jsonl_path):
     """Parse JSONL transcript and extract per-date session data.
 
     Returns (session_id, title, dates_dict) where dates_dict maps
@@ -314,6 +319,164 @@ def extract_session(jsonl_path):
     return session_id, title, dates
 
 
+def _content_text(content):
+    """Flatten Codex message content into text."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        text = block.get("text") or block.get("content")
+        if isinstance(text, str):
+            parts.append(text)
+    return "\n".join(parts)
+
+
+def _codex_project_short(meta):
+    """Return a readable project name from Codex session metadata."""
+    repository_url = (meta.get("git") or {}).get("repository_url", "")
+    if repository_url:
+        repository = repository_url.removesuffix(".git").rstrip("/")
+        parts = repository.split("/")
+        if len(parts) >= 2:
+            return "/".join(parts[-2:])
+    cwd = meta.get("cwd", "")
+    return Path(cwd).name if cwd else "~"
+
+
+def _extract_codex_session(jsonl_path):
+    """Parse a Codex rollout JSONL transcript."""
+    session_id = None
+    title = None
+    meta = {}
+    dates = {}
+    jira_re = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")
+
+    def _acc(date_str):
+        if date_str not in dates:
+            dates[date_str] = {
+                "started_at": None,
+                "ended_at": None,
+                "timestamps": [],
+                "user_messages": 0,
+                "assistant_messages": 0,
+                "files_touched": set(),
+                "tools_used": {},
+                "commits": [],
+                "mr_prs": [],
+                "jira_tickets": set(),
+                "user_snippets": [],
+                "assistant_snippets": [],
+            }
+        return dates[date_str]
+
+    with open(jsonl_path) as transcript:
+        for line in transcript:
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if entry.get("type") == "session_meta":
+                meta = entry.get("payload") or {}
+                session_id = meta.get("id") or meta.get("session_id")
+                continue
+
+            payload = entry.get("payload") or {}
+            if (
+                entry.get("type") != "event_msg"
+                or payload.get("type") != "item_completed"
+            ):
+                continue
+
+            item = payload.get("item") or {}
+            item_type = item.get("type")
+            timestamp = entry.get("timestamp")
+            date_str = _local_date(timestamp)
+            if not date_str or item_type not in (
+                "UserMessage",
+                "AgentMessage",
+                "CommandExecution",
+                "FileChange",
+                "Extension",
+            ):
+                continue
+
+            acc = _acc(date_str)
+            acc["timestamps"].append(timestamp)
+            acc["started_at"] = acc["started_at"] or timestamp
+            acc["ended_at"] = timestamp
+
+            if item_type == "UserMessage":
+                text = _content_text(item.get("content")).strip()
+                if not text:
+                    continue
+                acc["user_messages"] += 1
+                snippet = text.split("\n", 1)[0][:200]
+                if len(acc["user_snippets"]) < 10:
+                    acc["user_snippets"].append(snippet)
+                acc["jira_tickets"].update(jira_re.findall(text))
+                if title is None:
+                    title = snippet[:120]
+
+            elif item_type == "AgentMessage":
+                text = _content_text(item.get("content")).strip()
+                if not text:
+                    continue
+                acc["assistant_messages"] += 1
+                snippet = text.split("\n", 1)[0][:200]
+                if len(snippet) > 20 and len(acc["assistant_snippets"]) < 5:
+                    acc["assistant_snippets"].append(snippet)
+
+            elif item_type == "CommandExecution":
+                acc["tools_used"]["Shell"] = acc["tools_used"].get("Shell", 0) + 1
+                command = item.get("command", "")
+                if isinstance(command, list):
+                    command = " ".join(str(part) for part in command)
+                if "git commit" in command:
+                    commit = _extract_commit_message(command)
+                    if commit:
+                        acc["commits"].append(commit[:120])
+                acc["jira_tickets"].update(jira_re.findall(command))
+
+            elif item_type == "FileChange":
+                acc["tools_used"]["FileChange"] = (
+                    acc["tools_used"].get("FileChange", 0) + 1
+                )
+                acc["files_touched"].update((item.get("changes") or {}).keys())
+
+            elif item_type == "Extension":
+                name = item.get("kind") or "Extension"
+                acc["tools_used"][name] = acc["tools_used"].get(name, 0) + 1
+
+    project = meta.get("cwd", "") or Path(jsonl_path).parent.name
+    project_short = _codex_project_short(meta)
+    for acc in dates.values():
+        acc["files_touched"] = sorted(acc["files_touched"])
+        acc["jira_tickets"] = sorted(acc["jira_tickets"])
+        acc["project_dir"] = project
+        acc["project_short"] = project_short
+
+    return session_id, title, dates
+
+
+def extract_session(jsonl_path):
+    """Parse either a Claude Code or Codex JSONL transcript."""
+    with open(jsonl_path) as transcript:
+        for line in transcript:
+            try:
+                first_entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if first_entry.get("type") == "session_meta":
+                return _extract_codex_session(jsonl_path)
+            break
+    return _extract_claude_session(jsonl_path)
+
+
 def parse_timestamp(ts):
     """Parse ISO timestamp string to datetime."""
     if not ts:
@@ -365,6 +528,8 @@ def find_session_jsonl(session_id):
     for jsonl in CLAUDE_DIR.glob("projects/*/*.jsonl"):
         if jsonl.stem == session_id:
             return str(jsonl)
+    for jsonl in CODEX_DIR.glob(f"sessions/*/*/*/*{session_id}*.jsonl"):
+        return str(jsonl)
     return None
 
 
@@ -399,6 +564,31 @@ def find_all_sessions(days=None, target_date=None):
                 "session_id": jsonl.stem,
                 "jsonl_path": str(jsonl),
                 "project_dir": project_dir,
+                "mtime": mtime,
+            }
+        )
+    for jsonl in sorted(CODEX_DIR.glob("sessions/*/*/*/rollout-*.jsonl")):
+        stat = jsonl.stat()
+        mtime = datetime.fromtimestamp(stat.st_mtime)
+
+        if days is not None:
+            cutoff = datetime.now() - timedelta(days=days + 1)
+            if mtime < cutoff:
+                continue
+
+        if target_date:
+            target_dt = datetime.strptime(target_date, "%Y-%m-%d")
+            if mtime < target_dt - timedelta(days=1):
+                continue
+            if mtime > target_dt + timedelta(days=2):
+                continue
+
+        session_id = jsonl.stem.rsplit("-", 5)[-5:]
+        sessions.append(
+            {
+                "session_id": "-".join(session_id),
+                "jsonl_path": str(jsonl),
+                "project_dir": "codex",
                 "mtime": mtime,
             }
         )
@@ -446,6 +636,10 @@ def collect_session(session_id, jsonl_path=None, db=None):
 
     now = datetime.now().isoformat()
     for date_str, data in sorted(dates.items()):
+        session_project = data.get("project_dir", project_dir)
+        session_project_short = data.get(
+            "project_short", project_short_name(session_project)
+        )
         duration = compute_active_duration(data["timestamps"])
         db.execute(
             """INSERT OR REPLACE INTO sessions
@@ -459,8 +653,8 @@ def collect_session(session_id, jsonl_path=None, db=None):
             (
                 sid,
                 date_str,
-                project_dir,
-                project_short_name(project_dir),
+                session_project,
+                session_project_short,
                 title,
                 data["started_at"],
                 data["ended_at"],
@@ -502,6 +696,32 @@ def cmd_collect(args):
         print(f"Updated session {session_id} (file changed since last collection)")
     else:
         print(f"Could not find session {session_id}")
+
+
+def cmd_collect_hook(_args):
+    """Collect the session described by a Claude Code or Codex hook payload."""
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, OSError):
+        payload = {}
+
+    session_id = (
+        payload.get("session_id")
+        or payload.get("sessionId")
+        or os.environ.get("CODEX_SESSION_ID")
+        or os.environ.get("CODEX_THREAD_ID")
+        or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    )
+    jsonl_path = payload.get("transcript_path") or payload.get("transcriptPath")
+    if not session_id:
+        print("Hook payload did not include a session ID", file=sys.stderr)
+        return
+
+    result = collect_session(session_id, jsonl_path)
+    if result in ("collected", "updated"):
+        print(f"{result.title()} session {session_id}")
+    elif result is None:
+        print(f"Could not find session {session_id}", file=sys.stderr)
 
 
 def cmd_collect_all(args):
@@ -683,9 +903,7 @@ def build_summary_prompt(date, rows):
             session_lines.append(f"  Files: {', '.join(short_files)}")
 
         if commits:
-            session_lines.append(
-                f"  Commits: {'; '.join(c[:60] for c in commits[:3])}"
-            )
+            session_lines.append(f"  Commits: {'; '.join(c[:60] for c in commits[:3])}")
 
         if mrs:
             mr_strs = [m.get("url", "") for m in mrs[:3]]
@@ -835,9 +1053,7 @@ def cmd_export(args):
         "SELECT * FROM sessions WHERE date = ? ORDER BY started_at",
         (target_date,),
     ).fetchall()
-    cols = [
-        d[0] for d in db.execute("SELECT * FROM sessions LIMIT 0").description
-    ]
+    cols = [d[0] for d in db.execute("SELECT * FROM sessions LIMIT 0").description]
     db.close()
 
     sessions = []
@@ -900,6 +1116,7 @@ def main():
 
     commands = {
         "collect": cmd_collect,
+        "collect-hook": cmd_collect_hook,
         "collect-all": cmd_collect_all,
         "backfill": cmd_backfill,
         "prompt": cmd_prompt,
