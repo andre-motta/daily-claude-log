@@ -72,6 +72,7 @@ install_binary() {
 install_hook_file() {
     local settings_file="$1"
     local host_name="$2"
+    local hook_timeout="$3"
     local hook_cmd="$BIN_DIR/daily-claude-log collect-hook"
 
     mkdir -p "$(dirname "$settings_file")"
@@ -79,11 +80,12 @@ install_hook_file() {
         echo '{}' > "$settings_file"
     fi
 
-    python3 - "$settings_file" "$hook_cmd" <<'PY'
+    python3 - "$settings_file" "$hook_cmd" "$hook_timeout" <<'PY'
 import json
 import sys
 
-settings_path, hook_command = sys.argv[1:]
+settings_path, hook_command, hook_timeout = sys.argv[1:]
+hook_timeout = int(hook_timeout)
 with open(settings_path) as settings_file:
     settings = json.load(settings_file)
 
@@ -93,7 +95,7 @@ for group in session_end:
     for hook in group.get("hooks", []):
         if "daily-claude-log" in hook.get("command", ""):
             hook["command"] = hook_command
-            hook["timeout"] = 10
+            hook["timeout"] = hook_timeout
             found = True
 
 if not found:
@@ -101,7 +103,7 @@ if not found:
         "hooks": [{
             "type": "command",
             "command": hook_command,
-            "timeout": 10,
+            "timeout": hook_timeout,
         }]
     })
 
@@ -113,8 +115,8 @@ PY
 }
 
 install_hooks() {
-    install_hook_file "$CLAUDE_SETTINGS_FILE" "Claude Code"
-    install_hook_file "$CODEX_HOOKS_FILE" "Codex"
+    install_hook_file "$CLAUDE_SETTINGS_FILE" "Claude Code" 10
+    install_hook_file "$CODEX_HOOKS_FILE" "Codex" 3
 }
 
 # --- Install skills ---
