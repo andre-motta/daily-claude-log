@@ -1,8 +1,6 @@
 ---
 name: daily-summary
 description: Generate AI summary of your Claude Code and Codex sessions for a given day. Collects session data, builds a token-efficient prompt, and uses a fast model to synthesize a daily report + digest. Use when asked for a daily summary, end-of-day recap, or "what did I do today".
-arguments: [date]
-argument-hint: [YYYY-MM-DD] (default: today)
 allowed-tools: Bash(python3 *) Bash(daily-claude-log *) Bash(git *) Bash(cat *) Bash(ls *) Bash(date *) Read Write Agent
 ---
 
@@ -70,7 +68,9 @@ Read and display the generated summary to the user.
 Check if `$DCL_DATA_DIR` is a git repo. If so, offer to commit and push:
 
 ```bash
-cd "$DCL_DATA_DIR"
+data_dir="${DCL_DATA_DIR:-$HOME/.daily-claude-log}"
+data_dir="${data_dir/#\~/$HOME}"
+cd "$data_dir"
 git add reports/ recap.db
 git commit -m "daily-summary: $date_arg"
 git push
